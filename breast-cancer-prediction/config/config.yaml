@@ -1,0 +1,85 @@
+# Breast Cancer Prediction - Configuration
+project:
+  name: "breast-cancer-hackathon"
+  random_state: 42
+
+paths:
+  data_raw: "data/breast_cancer_prediction.csv"
+  data_cleaned: "data/breast_cancer_cleaned.csv"
+  model_dir: "models/"
+  output_dir: "outputs/"
+  plot_dir: "outputs/plots/"
+  metrics_dir: "outputs/metrics/"
+
+features:
+  drop:
+    - "Patient_ID"
+    - "Biopsy_Result"
+    - "Cancer_Stage"
+
+  target: "Cancer"
+
+  categorical:
+    binary:
+      - "Gender"
+      - "Family_History"
+      - "Smoking"
+      - "Alcohol_Consumption"
+      - "Hormone_Therapy"
+      - "Menopause_Status"
+      - "Genetic_Mutation"
+      - "Lymph_Node_Involvement"
+      - "Diabetes"
+    ordinal:
+      Physical_Activity: ["Low", "Moderate", "High"]
+      Mammogram_Result: ["Normal", "Suspicious", "Abnormal"]
+    onehot:
+      - "Breastfeeding_History"
+
+  numerical:
+    - "Age"
+    - "BMI"
+    - "Tumor_Size_cm"
+    - "Blood_Pressure"
+    - "Cholesterol"
+    - "Exercise_Days_Per_Week"
+    - "Annual_Income_USD"
+
+preprocessing:
+  imputation:
+    BMI: "median"
+    Alcohol_Consumption: "No"
+    Physical_Activity: "Moderate"
+    Tumor_Size_cm: "median"
+
+  outlier_capping:
+    BMI: [15.0, 50.0]
+
+  scaling: "StandardScaler"
+
+model:
+  test_size: 0.2
+  stratify: true
+
+  smote:
+    enabled: true
+    k_neighbors: 5
+
+  class_weight: "balanced"
+
+  hyperparameters:
+    random_forest:
+      n_estimators: [100, 200]
+      max_depth: [5, 10, 15]
+      min_samples_split: [2, 5]
+
+    xgboost:
+      max_depth: [3, 5, 7]
+      learning_rate: [0.01, 0.1]
+      n_estimators: [100, 200]
+
+evaluation:
+  primary_metric: "recall"  # For class 1 (Malignant)
+  target_recall: 0.90
+  target_f1: 0.85
+  target_roc_auc: 0.90

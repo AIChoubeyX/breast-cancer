@@ -47,5 +47,5 @@ outputs/metrics/*.json
 Thumbs.db
 
 # Local documentation (not for GitHub)
-DOCUMENTATION.md
+
 PRESENTATION_SCRIPT.md

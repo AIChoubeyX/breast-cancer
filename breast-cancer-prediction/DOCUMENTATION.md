@@ -523,9 +523,35 @@ Think of it like this: Tree 1 makes predictions. The second tree focuses on the 
 
 ## 6. Model Performance Comparison
 
-All three models are evaluated on the **same 20% test set** that was **never seen during training**. The primary metric for selection is **Recall** — because in cancer detection, missing a real cancer case (False Negative) is far more dangerous than a false alarm.
+The pipeline evaluates performance in **two separate phases** — it is important to understand the difference between them.
 
-### Final Metrics of the Selected Model (XGBoost)
+---
+
+### Phase 1 — Training Performance (Model Selection Comparison)
+
+After training, all three models are quickly compared on the **original training data** to decide which model to save as the best. These scores come from `outputs/metrics/model_comparison.json`.
+
+> **Note:** Scores on training data are always higher than on test data because the model has already seen this data. These scores are used only for **relative comparison** between the three models — not to claim real-world accuracy.
+
+| Model | Accuracy | Precision | Recall | F1-Score | ROC-AUC |
+|---|---|---|---|---|---|
+| **XGBoost** ✅ | **99.92%** | **100.00%** | **99.61%** | **99.81%** | **1.0000** |
+| Random Forest | 99.72% | 99.67% | 98.90% | 99.29% | 0.9994 |
+| Logistic Regression | 90.67% | 69.86% | 91.01% | 79.04% | 0.9718 |
+
+**XGBoost ranked #1 on Recall, Precision, Accuracy, and ROC-AUC — so it is automatically selected and saved.**
+
+Key observations from this comparison:
+- **XGBoost** dominates all metrics on training data with near-perfect scores
+- **Random Forest** is also very strong — a close second
+- **Logistic Regression** lags significantly in Precision (69.86%) and F1 (79.04%), confirming that the real relationship in this data is too complex for a simple linear model
+- Logistic Regression still achieves 91.01% Recall, which meets the 90% clinical target — but its precision is too low to be clinically useful
+
+---
+
+### Phase 2 — Final Test Performance (Real-World Evaluation)
+
+After selecting XGBoost, it is evaluated on the **held-out 20% test set** — data it has **never seen during training**. These are the honest, real-world performance numbers. They come from `outputs/metrics/final_metrics.json`.
 
 | Metric | Score | What It Means |
 |---|---|---|
@@ -536,7 +562,25 @@ All three models are evaluated on the **same 20% test set** that was **never see
 | **ROC-AUC** | **0.9985** | Nearly perfect separation between cancer and non-cancer patients |
 | **Decision Threshold** | **0.50** | If malignancy probability ≥ 50%, patient is flagged HIGH RISK |
 
-### What These Numbers Mean in Practice
+---
+
+### Training vs Test Score Gap (Overfitting Check)
+
+Comparing XGBoost's training scores versus test scores shows how well the model generalises:
+
+| Metric | Training Score | Test Score | Drop |
+|---|---|---|---|
+| Accuracy | 99.92% | 98.55% | −1.37% |
+| Precision | 100.00% | 96.13% | −3.87% |
+| Recall | 99.61% | 96.38% | −3.23% |
+| F1-Score | 99.81% | 96.26% | −3.55% |
+| ROC-AUC | 1.0000 | 0.9985 | −0.0015 |
+
+**The drop is small (~1–4%) which is completely normal and expected.** A drop of 10% or more would indicate serious overfitting. This confirms the model generalises well to new patients.
+
+---
+
+### What the Test Numbers Mean in Practice
 
 Imagine 1,000 patients, of which 100 actually have cancer:
 

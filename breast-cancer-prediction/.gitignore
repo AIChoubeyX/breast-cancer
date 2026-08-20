@@ -14,6 +14,7 @@ lib/
 lib64/
 parts/
 sdist/
+PRESENTATION_SCRIPT.md
 var/
 wheels/
 *.egg-info/
@@ -48,4 +49,4 @@ Thumbs.db
 
 # Local documentation (not for GitHub)
 .gitignore
-PRESENTATION_SCRIPT.md
+

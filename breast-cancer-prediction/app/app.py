@@ -5,7 +5,6 @@ and Model Performance Diagnostics.
 """
 
 import io
-import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -87,31 +86,26 @@ st.markdown(
 # 2. ARTIFACT INGESTION & CACHING
 # -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Loading predictive models & clinical artifacts...")
-def load_artifacts() -> Tuple[Any, Dict[str, Any], Any, Dict[str, Any]]:
+def load_artifacts() -> Tuple[Any, Dict[str, Any], Any]:
     """
-    Load serialized machine learning artifacts and evaluation metrics from disk.
+    Load serialized machine learning artifacts from disk.
     Cached for optimal session performance.
 
     Returns:
         scaler: Fitted StandardScaler instance.
         encoders: Mapping dictionaries and feature schemas.
         model: Trained best classifier (XGBoost).
-        metrics: Final test evaluation metrics dictionary.
     """
-    # Resolve relative paths dynamically
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    
+
     scaler_path = os.path.join(base_dir, "models", "scaler.pkl")
     encoders_path = os.path.join(base_dir, "models", "encoders.pkl")
     model_path = os.path.join(base_dir, "models", "best_model.pkl")
-    metrics_path = os.path.join(base_dir, "outputs", "metrics", "final_metrics.json")
 
-    # Fallback to local working directory paths if needed
     if not os.path.exists(scaler_path):
         scaler_path = "models/scaler.pkl"
         encoders_path = "models/encoders.pkl"
         model_path = "models/best_model.pkl"
-        metrics_path = "outputs/metrics/final_metrics.json"
 
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model artifact not found at {model_path}. Please execute src/train.py first.")
@@ -120,20 +114,7 @@ def load_artifacts() -> Tuple[Any, Dict[str, Any], Any, Dict[str, Any]]:
     encoders = joblib.load(encoders_path)
     model = joblib.load(model_path)
 
-    if os.path.exists(metrics_path):
-        with open(metrics_path, "r", encoding="utf-8") as f:
-            metrics = json.load(f)
-    else:
-        metrics = {
-            "Accuracy": 0.9855,
-            "Precision": 0.9613,
-            "Recall": 0.9638,
-            "F1_Score": 0.9626,
-            "ROC_AUC": 0.9985,
-            "Optimal_Threshold": 0.50,
-        }
-
-    return scaler, encoders, model, metrics
+    return scaler, encoders, model
 
 
 # -----------------------------------------------------------------------------
@@ -275,13 +256,13 @@ def main() -> None:
     )
 
     try:
-        scaler, encoders, model, metrics = load_artifacts()
+        scaler, encoders, model = load_artifacts()
     except Exception as e:
         st.error(f"Error loading system artifacts: {str(e)}")
         st.info("Please make sure you have run the training pipeline first: `python -m src.train`")
         return
 
-    optimal_threshold = float(metrics.get("Optimal_Threshold", 0.50))
+    optimal_threshold = 0.50
 
     # Sidebar Navigation
     st.sidebar.image("https://img.icons8.com/color/96/000000/medical-doctor.png", width=70)
@@ -291,12 +272,9 @@ def main() -> None:
         ["Single Patient Prediction", "Batch Upload (CSV)"],
     )
 
-    # Sidebar Model Diagnostic Card
     st.sidebar.markdown("---")
-    st.sidebar.subheader("Clinical Model Specs")
+    st.sidebar.subheader("Model Info")
     st.sidebar.markdown(f"**Architecture:** `{type(model).__name__}`")
-    st.sidebar.markdown(f"**Target Recall:** `96.38%`")
-    st.sidebar.markdown(f"**ROC-AUC:** `0.9985`")
     st.sidebar.markdown(f"**Decision Threshold:** `{optimal_threshold:.2f}`")
     st.sidebar.markdown("---")
 
@@ -526,28 +504,10 @@ def main() -> None:
             except Exception as e:
                 st.error(f"Error during batch CSV processing: {str(e)}")
 
-    # =========================================================================
-    # 5. MODEL PERFORMANCE & CLINICAL DISCLAIMER (BOTTOM SECTION)
-    # =========================================================================
-    st.markdown("---")
-    st.subheader("📈 Validated Model Performance Benchmarks (Test Set)")
-
-    pcol1, pcol2, pcol3, pcol4, pcol5 = st.columns(5)
-    with pcol1:
-        st.metric(label="Malignant Recall (Sensitivity)", value=f"{metrics.get('Recall', 0.9638) * 100:.2f}%")
-    with pcol2:
-        st.metric(label="Precision (PPV)", value=f"{metrics.get('Precision', 0.9613) * 100:.2f}%")
-    with pcol3:
-        st.metric(label="F1-Score", value=f"{metrics.get('F1_Score', 0.9626) * 100:.2f}%")
-    with pcol4:
-        st.metric(label="ROC-AUC Score", value=f"{metrics.get('ROC_AUC', 0.9985):.4f}")
-    with pcol5:
-        st.metric(label="Test Accuracy", value=f"{metrics.get('Accuracy', 0.9855) * 100:.2f}%")
-
     st.markdown(
         """
         <div class="disclaimer-box">
-            <b>⚕️ Clinical Disclaimer:</b> This tool is for decision support only. Not a medical diagnosis. 
+            <b>⚕️ Clinical Disclaimer:</b> This tool is for decision support only. Not a medical diagnosis.
             All algorithmic risk scores must be corroborated by certified clinical practitioners and formal oncology imaging.
         </div>
         """,

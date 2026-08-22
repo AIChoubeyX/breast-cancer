@@ -151,21 +151,33 @@ def preprocess_input(
         if col in df.columns:
             df = df.drop(columns=[col])
 
-    # 2. Impute missing values
-    if "BMI" in df.columns:
-        df["BMI"] = pd.to_numeric(df["BMI"], errors="coerce").fillna(27.0)
-    if "Tumor_Size_cm" in df.columns:
-        df["Tumor_Size_cm"] = pd.to_numeric(df["Tumor_Size_cm"], errors="coerce").fillna(2.37)
-    if "Alcohol_Consumption" in df.columns:
-        df["Alcohol_Consumption"] = df["Alcohol_Consumption"].fillna("No")
-    if "Physical_Activity" in df.columns:
-        df["Physical_Activity"] = df["Physical_Activity"].fillna("Moderate")
-    if "Hormone_Therapy" in df.columns:
-        df["Hormone_Therapy"] = df["Hormone_Therapy"].fillna("No")
+    # 2. Impute missing values.
+    #
+    # Medians come from the training split and are persisted by src.train, rather
+    # than being hard-coded here. Hard-coded constants drift silently the moment
+    # the training data changes, and an inference-time fill that differs from the
+    # training-time fill shifts inputs away from the distribution the scaler and
+    # model were fitted on.
+    medians = encoders.get("median_imputations", {})
+    for col in ("BMI", "Tumor_Size_cm"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            if col in medians:
+                df[col] = df[col].fillna(float(medians[col]))
 
-    # 3. Handle outliers
+    categorical_fills = encoders.get("categorical_fill_defaults", {
+        "Alcohol_Consumption": "No",
+        "Physical_Activity": "Moderate",
+        "Hormone_Therapy": "No",
+    })
+    for col, fill in categorical_fills.items():
+        if col in df.columns:
+            df[col] = df[col].fillna(fill)
+
+    # 3. Clip BMI to the same fixed physiological bounds used in training.
+    bmi_low, bmi_high = encoders.get("bmi_bounds", (15.0, 50.0))
     if "BMI" in df.columns:
-        df["BMI"] = df["BMI"].clip(lower=15.0, upper=50.0)
+        df["BMI"] = df["BMI"].clip(lower=float(bmi_low), upper=float(bmi_high))
 
     # 4. Map binary categories
     binary_maps = encoders.get("binary_maps", {})
@@ -179,9 +191,27 @@ def preprocess_input(
         if col in df.columns:
             df[col] = df[col].astype(str).map(mapping).fillna(0.0).astype(float)
 
-    # 6. One-Hot Encoding for Breastfeeding_History
-    if "Breastfeeding_History" in df.columns:
-        df = pd.get_dummies(df, columns=["Breastfeeding_History"], drop_first=True, dtype=float)
+    # 6. One-hot encode against a FIXED category list.
+    #
+    # pd.get_dummies(drop_first=True) cannot be used at inference time. It derives
+    # both the column set and the reference level from whatever values happen to be
+    # present in the input. On a single-patient frame only one category is present,
+    # drop_first deletes it, and the field vanishes -- step 7 then backfills both
+    # dummies with 0.0, which is the encoding for "No". The user's selection was
+    # silently discarded. In batch mode the reference level shifts with the file's
+    # contents, so identical patients encode differently in different uploads.
+    #
+    # Iterating a fixed list makes the encoding independent of the input rows and
+    # keeps the reference level identical to training.
+    onehot_categories = encoders.get("onehot_categories", {
+        "Breastfeeding_History": ["No", "Not Applicable", "Yes"],
+    })
+    for col, categories in onehot_categories.items():
+        if col in df.columns:
+            values = df[col].astype(str)
+            for category in list(categories)[1:]:      # first level = reference
+                df[f"{col}_{category}"] = (values == category).astype(float)
+            df = df.drop(columns=[col])
 
     # 7. Re-align with exact model feature names
     expected_features = encoders.get("feature_names", [])
@@ -262,7 +292,17 @@ def main() -> None:
         st.info("Please make sure you have run the training pipeline first: `python -m src.train`")
         return
 
-    optimal_threshold = 0.50
+    # Decision threshold comes from the training artifacts, where it was chosen on
+    # the validation set and locked before the test set was scored. Hard-coding
+    # 0.50 here would silently override that choice, so the app would operate at a
+    # different point than the one every reported metric describes.
+    if "decision_threshold" not in encoders:
+        st.error(
+            "This model was saved without a decision threshold. Re-run "
+            "`python -m src.train` so the validation-selected threshold is persisted."
+        )
+        return
+    optimal_threshold = float(encoders["decision_threshold"])
 
     # Sidebar Navigation
     st.sidebar.image("https://img.icons8.com/color/96/000000/medical-doctor.png", width=70)
@@ -436,13 +476,45 @@ def main() -> None:
                 df_batch_raw = pd.read_csv(uploaded_file)
                 st.success(f"File successfully loaded: `{uploaded_file.name}` ({df_batch_raw.shape[0]:,} records)")
 
-                # Required minimal features validation
-                required_cols = ["Age", "Gender", "BMI", "Tumor_Size_cm", "Mammogram_Result"]
+                # Column validation.
+                #
+                # Any modelled column absent from the upload gets filled with 0.0
+                # during alignment, and for a binary map 0.0 is a real level ("No",
+                # "Negative"). So an absent column does not produce an error or a
+                # blank -- it produces a confident prediction based on an assumption
+                # the uploader never made. The eight features below are the ones that
+                # actually drive the model, so missing any of them is treated as a
+                # hard failure rather than a silent default.
+                required_cols = [
+                    "Age", "BMI", "Tumor_Size_cm", "Family_History", "Smoking",
+                    "Genetic_Mutation", "Lymph_Node_Involvement", "Mammogram_Result",
+                ]
                 missing_req = [c for c in required_cols if c not in df_batch_raw.columns]
-                
+
                 if missing_req:
-                    st.error(f"Uploaded CSV is missing critical clinical columns: {missing_req}")
+                    st.error(
+                        f"Uploaded CSV is missing columns the model relies on: {missing_req}. "
+                        "These are not optional -- absent columns would be silently "
+                        "treated as low-risk values, producing confident but unfounded "
+                        "predictions. Please add them and re-upload."
+                    )
                     return
+
+                # Remaining modelled columns contribute little, but the user should
+                # still be told when a value was assumed rather than supplied.
+                modelled_inputs = [
+                    "Gender", "Alcohol_Consumption", "Physical_Activity",
+                    "Hormone_Therapy", "Menopause_Status", "Blood_Pressure",
+                    "Cholesterol", "Diabetes", "Exercise_Days_Per_Week",
+                    "Annual_Income_USD", "Breastfeeding_History",
+                ]
+                defaulted = [c for c in modelled_inputs if c not in df_batch_raw.columns]
+                if defaulted:
+                    st.warning(
+                        f"These columns were absent and have been filled with default "
+                        f"values: {defaulted}. Predictions remain valid but rest partly "
+                        "on assumed inputs."
+                    )
 
                 with st.spinner("Processing batch cohort and running inference..."):
                     df_batch_proc = preprocess_input(df_batch_raw, scaler, encoders)

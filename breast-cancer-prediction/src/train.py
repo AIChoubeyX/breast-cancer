@@ -1,340 +1,488 @@
 """
-Model Training and Comparison Module for Breast Cancer Prediction.
-Implements Logistic Regression, Random Forest, and XGBoost with hyperparameter tuning,
-SMOTE class-imbalance mitigation, validation evaluation, and best-model selection.
+Model Training, Imbalance Experiments and Selection for Breast Cancer Prediction.
+
+METHODOLOGY
+-----------
+Data is split 64% train / 16% validation / 20% test (stratified, random_state=42).
+
+    TRAIN       hyperparameter search via 5-fold cross-validation
+    VALIDATION  imbalance-strategy comparison, model selection, threshold choice
+    TEST        untouched here -- used only by src/evaluate.py, exactly once
+
+Two imbalance strategies are compared as CONTROLLED ALTERNATIVES rather than
+stacked on top of each other (the previous version applied SMOTE *and*
+class_weight='balanced' *and* scale_pos_weight simultaneously, which
+double-counts the minority class and makes the effective reweighting unknowable):
+
+    Experiment A  "class_weight"  -- cost-sensitive learning, no resampling
+    Experiment B  "smotenc"       -- SMOTENC resampling, no extra class weighting
+
+SMOTENC (not SMOTE) is used because the feature matrix is mixed-type: 13 of the
+20 columns are binary / ordinal / one-hot. Plain SMOTE interpolates linearly
+between neighbours, which produces values like Family_History = 0.63 or
+Mammogram_Result = 1.37 -- states no patient can occupy. SMOTENC interpolates the
+continuous columns and takes the majority category among neighbours for the
+categorical ones.
+
+SMOTENC sits INSIDE the cross-validation pipeline, so every fold resamples only
+its own training portion. Resampling before GridSearchCV (the previous behaviour)
+leaks synthetic rows -- interpolated from held-out patients -- into the validation
+folds, which inflates CV scores.
+
+Hyperparameters are tuned on average precision, not recall. Optimising recall
+directly rewards a model for predicting "malignant" for everyone (recall = 1.0 at
+zero clinical value). Average precision is threshold-free and focused on the
+positive class, so model quality and operating point are chosen separately: the
+grid search picks the model, then the decision threshold is tuned on validation
+to hit the recall target.
 """
 
-import os
 import json
-import logging
-from typing import Any, Dict, Optional, Tuple, Union
+import os
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
-import joblib
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import GridSearchCV
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
+    f1_score,
     precision_score,
     recall_score,
-    f1_score,
     roc_auc_score,
 )
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from xgboost import XGBClassifier
 
 from src.preprocess import (
-    handle_missing,
-    handle_outliers,
-    encode_features,
-    split_data,
-    scale_features,
-    apply_smote,
-    preprocess_pipeline,
+    build_pipeline,
+    build_preprocessor,
+    get_categorical_indices,
+    prepare_data,
+    save_inference_artifacts,
 )
-from src.utils import load_config, save_artifact, setup_logging
+from src.utils import save_artifact, setup_logging
 
 logger = setup_logging()
 
-# Global registry of trained models in current session
-_TRAINED_MODELS_CACHE: Dict[str, Any] = {}
+RANDOM_STATE = 42
+
+# Candidate decision thresholds evaluated on validation data only.
+CANDIDATE_THRESHOLDS: List[float] = [0.50, 0.45, 0.40, 0.35, 0.30]
+
+# Clinical targets. Recall on the malignant class is the primary objective; the
+# precision floor stops the threshold search from collapsing to "flag everyone".
+TARGET_RECALL = 0.90
+MIN_PRECISION = 0.70
 
 
-def load_preprocessed_data(
-    data_path: str = "data/breast_cancer_cleaned.csv",
-    config_path: str = "config/config.yaml",
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.DataFrame, pd.Series]:
-    """
-    Load cleaned dataset and run the full preprocessing pipeline:
-    missing value imputation, outlier handling, encoding, train/test split,
-    feature scaling, and SMOTE oversampling on training data.
-
-    Parameters:
-        data_path: Path to cleaned dataset CSV.
-        config_path: Path to config YAML.
-
-    Returns:
-        X_train, X_test, y_train, y_test, X_train_res, y_train_res
-    """
-    logger.info("Loading dataset and executing preprocessing pipeline...")
-    return preprocess_pipeline(data_path=data_path, config_path=config_path)
-
-
-def train_logistic_regression(
-    X_train: pd.DataFrame,
+# -----------------------------------------------------------------------------
+# Model / experiment definitions
+# -----------------------------------------------------------------------------
+def build_experiments(
     y_train: pd.Series,
-    random_state: int = 42,
-) -> LogisticRegression:
+    random_state: int = RANDOM_STATE,
+) -> List[Dict[str, Any]]:
     """
-    Train a Logistic Regression baseline model with balanced class weights.
+    Define the controlled imbalance experiments.
 
-    Parameters:
-        X_train: Training feature matrix.
-        y_train: Training target labels.
-        random_state: Random state seed.
-
-    Returns:
-        Trained LogisticRegression model.
+    Experiment A applies cost-sensitive weighting and no resampling.
+    Experiment B applies SMOTENC and NO additional weighting, so the two
+    mechanisms are never combined and their effects stay separable.
     """
-    logger.info("Training Logistic Regression (class_weight='balanced', max_iter=1000)...")
-    model = LogisticRegression(
-        class_weight="balanced",
-        max_iter=1000,
-        random_state=random_state,
-    )
-    model.fit(X_train, y_train)
-    _TRAINED_MODELS_CACHE["LogisticRegression"] = model
-    logger.info("Logistic Regression training completed.")
-    return model
-
-
-def train_random_forest(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    random_state: int = 42,
-) -> RandomForestClassifier:
-    """
-    Train a Random Forest classifier with hyperparameter grid search optimizing Recall.
-
-    Parameters:
-        X_train: Training feature matrix.
-        y_train: Training target labels.
-        random_state: Random state seed.
-
-    Returns:
-        Best estimator RandomForestClassifier instance.
-    """
-    logger.info("Training Random Forest with GridSearchCV (optimizing Recall)...")
-    rf = RandomForestClassifier(
-        class_weight="balanced",
-        random_state=random_state,
-        n_jobs=-1,
+    neg = int((y_train == 0).sum())
+    pos = int((y_train == 1).sum())
+    scale_pos_weight = float(neg / pos) if pos else 1.0
+    logger.info(
+        f"Train class balance: {neg} benign / {pos} malignant "
+        f"-> scale_pos_weight = {scale_pos_weight:.4f}"
     )
 
-    param_grid = {
-        "n_estimators": [100, 200],
-        "max_depth": [5, 10, 15],
-        "min_samples_split": [2, 5],
+    experiments: List[Dict[str, Any]] = []
+
+    # ---- Logistic Regression -------------------------------------------------
+    lr_grid = {"clf__C": [0.01, 0.1, 1.0, 10.0]}
+    experiments.append({
+        "model": "LogisticRegression",
+        "imbalance": "class_weight",
+        "estimator": LogisticRegression(
+            class_weight="balanced", max_iter=2000, random_state=random_state
+        ),
+        "param_grid": lr_grid,
+        "use_smotenc": False,
+    })
+    experiments.append({
+        "model": "LogisticRegression",
+        "imbalance": "smotenc",
+        "estimator": LogisticRegression(
+            class_weight=None, max_iter=2000, random_state=random_state
+        ),
+        "param_grid": lr_grid,
+        "use_smotenc": True,
+    })
+
+    # ---- Random Forest -------------------------------------------------------
+    rf_grid = {
+        "clf__n_estimators": [100, 200],
+        "clf__max_depth": [5, 10, 15],
+        "clf__min_samples_split": [2, 5],
     }
+    experiments.append({
+        "model": "RandomForest",
+        "imbalance": "class_weight",
+        "estimator": RandomForestClassifier(
+            class_weight="balanced", random_state=random_state, n_jobs=-1
+        ),
+        "param_grid": rf_grid,
+        "use_smotenc": False,
+    })
+    experiments.append({
+        "model": "RandomForest",
+        "imbalance": "smotenc",
+        "estimator": RandomForestClassifier(
+            class_weight=None, random_state=random_state, n_jobs=-1
+        ),
+        "param_grid": rf_grid,
+        "use_smotenc": True,
+    })
 
-    grid = GridSearchCV(
-        estimator=rf,
-        param_grid=param_grid,
-        cv=3,
-        scoring="recall",
-        n_jobs=-1,
-        verbose=0,
-    )
-    grid.fit(X_train, y_train)
-    best_rf = grid.best_estimator_
-    _TRAINED_MODELS_CACHE["RandomForest"] = best_rf
-
-    logger.info(f"Random Forest Best Params: {grid.best_params_} | Best CV Recall: {grid.best_score_:.4f}")
-    return best_rf
-
-
-def train_xgboost(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    random_state: int = 42,
-) -> XGBClassifier:
-    """
-    Train an XGBoost classifier with hyperparameter grid search optimizing Recall,
-    accounting for class imbalance via scale_pos_weight.
-
-    Parameters:
-        X_train: Training feature matrix.
-        y_train: Training target labels.
-        random_state: Random state seed.
-
-    Returns:
-        Best estimator XGBClassifier instance.
-    """
-    logger.info("Training XGBoost with GridSearchCV (optimizing Recall)...")
-    neg_count = (y_train == 0).sum()
-    pos_count = (y_train == 1).sum()
-    scale_pos_weight = float(neg_count / pos_count) if pos_count > 0 else 1.0
-
-    xgb = XGBClassifier(
-        scale_pos_weight=scale_pos_weight,
-        random_state=random_state,
-        eval_metric="logloss",
-        n_jobs=-1,
-    )
-
-    param_grid = {
-        "max_depth": [3, 5, 7],
-        "learning_rate": [0.01, 0.1],
-        "n_estimators": [100, 200],
+    # ---- XGBoost -------------------------------------------------------------
+    xgb_grid = {
+        "clf__max_depth": [3, 5, 7],
+        "clf__learning_rate": [0.01, 0.1],
+        "clf__n_estimators": [100, 200],
     }
+    experiments.append({
+        "model": "XGBoost",
+        "imbalance": "class_weight",
+        "estimator": XGBClassifier(
+            scale_pos_weight=scale_pos_weight,
+            random_state=random_state,
+            eval_metric="logloss",
+            n_jobs=-1,
+            tree_method="hist",
+        ),
+        "param_grid": xgb_grid,
+        "use_smotenc": False,
+    })
+    experiments.append({
+        "model": "XGBoost",
+        # scale_pos_weight deliberately left at its default 1.0: SMOTENC has
+        # already balanced the training folds, so weighting again would
+        # double-count the minority class.
+        "imbalance": "smotenc",
+        "estimator": XGBClassifier(
+            scale_pos_weight=1.0,
+            random_state=random_state,
+            eval_metric="logloss",
+            n_jobs=-1,
+            tree_method="hist",
+        ),
+        "param_grid": xgb_grid,
+        "use_smotenc": True,
+    })
 
-    grid = GridSearchCV(
-        estimator=xgb,
-        param_grid=param_grid,
-        cv=3,
-        scoring="recall",
-        n_jobs=-1,
-        verbose=0,
-    )
-    grid.fit(X_train, y_train)
-    best_xgb = grid.best_estimator_
-    _TRAINED_MODELS_CACHE["XGBoost"] = best_xgb
-
-    logger.info(f"XGBoost Best Params: {grid.best_params_} | Best CV Recall: {grid.best_score_:.4f}")
-    return best_xgb
+    return experiments
 
 
-def evaluate_on_validation(
-    models_dict: Dict[str, Any],
-    X_val: pd.DataFrame,
+# -----------------------------------------------------------------------------
+# Threshold selection (VALIDATION ONLY)
+# -----------------------------------------------------------------------------
+def select_threshold(
     y_val: pd.Series,
-) -> pd.DataFrame:
+    y_proba_val: np.ndarray,
+    candidates: Optional[List[float]] = None,
+    target_recall: float = TARGET_RECALL,
+    min_precision: float = MIN_PRECISION,
+) -> Tuple[float, List[Dict[str, float]]]:
     """
-    Evaluate all models on a validation set across key clinical metrics,
-    prioritizing Recall for class 1 (Malignant).
+    Choose the decision threshold using VALIDATION data only.
 
-    Parameters:
-        models_dict: Dictionary of {model_name: trained_model_instance}.
-        X_val: Validation feature matrix.
-        y_val: Validation true labels.
+    Documented rule, applied deterministically:
+      1. Keep candidates whose validation precision >= min_precision.
+      2. Among those, take the highest recall (missed cancers are the costly error).
+      3. Break ties on F1, then on the higher threshold (fewer false alarms).
+      4. If no candidate clears the precision floor, fall back to max F1 and warn.
 
-    Returns:
-        Comparison DataFrame sorted by Recall (descending).
+    Returns the chosen threshold and the full sweep table for reporting.
     """
-    logger.info("Evaluating models on validation dataset...")
-    results = []
+    candidates = candidates or CANDIDATE_THRESHOLDS
 
-    for name, model in models_dict.items():
-        y_pred = model.predict(X_val)
-        
-        acc = accuracy_score(y_val, y_pred)
-        prec = precision_score(y_val, y_pred, pos_label=1, zero_division=0)
-        rec = recall_score(y_val, y_pred, pos_label=1, zero_division=0)
-        f1 = f1_score(y_val, y_pred, pos_label=1, zero_division=0)
-
-        # ROC-AUC score using predicted probabilities
-        if hasattr(model, "predict_proba"):
-            y_proba = model.predict_proba(X_val)[:, 1]
-            auc = roc_auc_score(y_val, y_proba)
-        elif hasattr(model, "decision_function"):
-            y_score = model.decision_function(X_val)
-            auc = roc_auc_score(y_val, y_score)
-        else:
-            auc = np.nan
-
-        results.append({
-            "Model": name,
-            "Accuracy": round(float(acc), 4),
-            "Precision": round(float(prec), 4),
-            "Recall": round(float(rec), 4),
-            "F1_Score": round(float(f1), 4),
-            "ROC_AUC": round(float(auc), 4),
+    sweep: List[Dict[str, float]] = []
+    for t in candidates:
+        y_pred = (y_proba_val >= t).astype(int)
+        sweep.append({
+            "Threshold": round(float(t), 3),
+            "Precision": round(float(precision_score(y_val, y_pred, pos_label=1, zero_division=0)), 4),
+            "Recall": round(float(recall_score(y_val, y_pred, pos_label=1, zero_division=0)), 4),
+            "F1_Score": round(float(f1_score(y_val, y_pred, pos_label=1, zero_division=0)), 4),
+            "Accuracy": round(float(accuracy_score(y_val, y_pred)), 4),
         })
 
-    comparison_df = pd.DataFrame(results).sort_values(by=["Recall", "ROC_AUC", "F1_Score"], ascending=False)
-    comparison_df = comparison_df.reset_index(drop=True)
-    
-    logger.info("Model validation comparison computed successfully.")
-    return comparison_df
-
-
-def select_best_model(
-    comparison_df: pd.DataFrame,
-    metric: str = "Recall",
-    models_dict: Optional[Dict[str, Any]] = None,
-    save_path: str = "models/best_model.pkl",
-) -> Union[str, Any]:
-    """
-    Select the best model based on the target metric (default: Recall for Malignant class),
-    persist the model artifact to disk, and issue clinical threshold warnings if needed.
-
-    Parameters:
-        comparison_df: Comparison DataFrame from evaluate_on_validation.
-        metric: Metric column name to maximize (case-insensitive).
-        models_dict: Optional dictionary of model instances (defaults to internal cache).
-        save_path: Destination path for best model serialization.
-
-    Returns:
-        Best model name or best model object.
-    """
-    # Normalize metric name to match columns
-    matched_col = None
-    for col in comparison_df.columns:
-        if col.lower() == metric.lower():
-            matched_col = col
-            break
-    
-    if not matched_col:
-        matched_col = "Recall"
-
-    best_row = comparison_df.sort_values(by=matched_col, ascending=False).iloc[0]
-    best_model_name = str(best_row["Model"])
-    best_metric_val = float(best_row[matched_col])
-
-    logger.info(f"Selected Best Model: '{best_model_name}' based on {matched_col} = {best_metric_val:.4f}")
-
-    # Clinical warning check
-    best_recall = float(best_row.get("Recall", best_metric_val))
-    if best_recall < 0.90:
-        warning_msg = (
-            f"WARNING: Best model '{best_model_name}' achieved Recall = {best_recall:.4f} (< 0.90 target). "
-            "Clinical decision threshold tuning is recommended to reduce False Negatives!"
+    eligible = [r for r in sweep if r["Precision"] >= min_precision]
+    if eligible:
+        best = sorted(
+            eligible,
+            key=lambda r: (r["Recall"], r["F1_Score"], r["Threshold"]),
+            reverse=True,
+        )[0]
+    else:
+        best = sorted(sweep, key=lambda r: (r["F1_Score"], r["Threshold"]), reverse=True)[0]
+        logger.warning(
+            f"No candidate threshold reached precision >= {min_precision}. "
+            f"Falling back to max-F1 threshold {best['Threshold']}."
         )
-        print(f"\n[!] {warning_msg}\n")
-        logger.warning(warning_msg)
 
-    # Save best model artifact
-    models = models_dict if models_dict is not None else _TRAINED_MODELS_CACHE
-    best_model_obj = models.get(best_model_name)
+    chosen = float(best["Threshold"])
+    if best["Recall"] < target_recall:
+        logger.warning(
+            f"Validation recall at chosen threshold {chosen} is {best['Recall']:.4f}, "
+            f"below the {target_recall} target."
+        )
+    logger.info(
+        f"Threshold selected on VALIDATION: {chosen} "
+        f"(recall={best['Recall']:.4f}, precision={best['Precision']:.4f}, F1={best['F1_Score']:.4f})"
+    )
+    return chosen, sweep
 
-    if best_model_obj is not None:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        save_artifact(best_model_obj, save_path)
-        logger.info(f"Best model artifact saved to {save_path}")
 
-    return best_model_name
-
-
-def save_comparison_results(
-    comparison_df: pd.DataFrame,
-    path: str = "outputs/metrics/model_comparison.json",
-) -> None:
+# -----------------------------------------------------------------------------
+# Experiment runner
+# -----------------------------------------------------------------------------
+def run_experiment(
+    experiment: Dict[str, Any],
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    feature_names: List[str],
+    numeric_cols: List[str],
+    cv_folds: int = 5,
+    scoring: str = "average_precision",
+) -> Dict[str, Any]:
     """
-    Save model comparison metrics to JSON format.
+    Tune one model/imbalance combination with cross-validation on TRAIN, then score
+    it on VALIDATION.
 
-    Parameters:
-        comparison_df: Comparison DataFrame.
-        path: Filepath for output JSON.
+    The whole pipeline (impute -> scale -> optional SMOTENC -> classifier) goes into
+    GridSearchCV, so every fold fits its own imputation medians, its own scaler and
+    its own SMOTENC on that fold's training portion only.
     """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    records = comparison_df.to_dict(orient="records")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=4)
-    logger.info(f"Model comparison metrics saved to {path}")
+    label = f"{experiment['model']} [{experiment['imbalance']}]"
+    logger.info(f"--- Running experiment: {label} ---")
 
+    pipeline = build_pipeline(
+        classifier=experiment["estimator"],
+        feature_names=feature_names,
+        numeric_cols=numeric_cols,
+        use_smotenc=experiment["use_smotenc"],
+        random_state=RANDOM_STATE,
+    )
 
-if __name__ == "__main__":
-    logger.info("Starting model training pipeline...")
+    grid = GridSearchCV(
+        estimator=pipeline,
+        param_grid=experiment["param_grid"],
+        cv=StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_STATE),
+        scoring=scoring,
+        n_jobs=1,          # inner estimators already use n_jobs=-1
+        refit=True,
+        verbose=0,
+    )
 
-    # 1. Load and preprocess data
-    X_train, X_test, y_train, y_test, X_train_r, y_train_r = load_preprocessed_data()
+    t0 = time.perf_counter()
+    grid.fit(X_train, y_train)
+    train_seconds = time.perf_counter() - t0
 
-    # 2. Train models on SMOTE-resampled training data
-    models = {
-        "LogisticRegression": train_logistic_regression(X_train_r, y_train_r),
-        "RandomForest": train_random_forest(X_train_r, y_train_r),
-        "XGBoost": train_xgboost(X_train_r, y_train_r),
+    best_pipeline = grid.best_estimator_
+
+    t0 = time.perf_counter()
+    y_proba_val = best_pipeline.predict_proba(X_val)[:, 1]
+    inference_seconds = time.perf_counter() - t0
+
+    # Threshold chosen on validation, per experiment.
+    threshold, sweep = select_threshold(y_val, y_proba_val)
+    y_pred_val = (y_proba_val >= threshold).astype(int)
+
+    # Also record the default operating point for a like-for-like comparison.
+    y_pred_default = (y_proba_val >= 0.50).astype(int)
+
+    result = {
+        "Model": experiment["model"],
+        "Imbalance_Method": experiment["imbalance"],
+        "Best_Params": {k.replace("clf__", ""): v for k, v in grid.best_params_.items()},
+        "CV_Metric": scoring,
+        "CV_Score_Mean": round(float(grid.best_score_), 4),
+        "CV_Score_Std": round(
+            float(grid.cv_results_["std_test_score"][grid.best_index_]), 4
+        ),
+        "Threshold": round(float(threshold), 3),
+        "Val_Accuracy": round(float(accuracy_score(y_val, y_pred_val)), 4),
+        "Val_Precision": round(float(precision_score(y_val, y_pred_val, pos_label=1, zero_division=0)), 4),
+        "Val_Recall": round(float(recall_score(y_val, y_pred_val, pos_label=1, zero_division=0)), 4),
+        "Val_F1": round(float(f1_score(y_val, y_pred_val, pos_label=1, zero_division=0)), 4),
+        "Val_ROC_AUC": round(float(roc_auc_score(y_val, y_proba_val)), 4),
+        "Val_Avg_Precision": round(float(average_precision_score(y_val, y_proba_val)), 4),
+        "Val_Recall_at_0.50": round(float(recall_score(y_val, y_pred_default, pos_label=1, zero_division=0)), 4),
+        "Val_Precision_at_0.50": round(float(precision_score(y_val, y_pred_default, pos_label=1, zero_division=0)), 4),
+        "Train_Time_Seconds": round(train_seconds, 2),
+        "Inference_Time_ms_per_1k": round(
+            inference_seconds / max(len(X_val), 1) * 1_000_000, 3
+        ),
+        "Threshold_Sweep": sweep,
     }
 
-    # 3. Evaluate on original (non-SMOTE) training set as quick validation
-    comparison = evaluate_on_validation(models, X_train, y_train)
-    print("\n--- Model Comparison on Validation Data ---")
-    print(comparison.to_string(index=False))
+    logger.info(
+        f"{label}: CV {scoring}={result['CV_Score_Mean']:.4f} | "
+        f"val recall={result['Val_Recall']:.4f} precision={result['Val_Precision']:.4f} "
+        f"F1={result['Val_F1']:.4f} AUC={result['Val_ROC_AUC']:.4f} @t={result['Threshold']}"
+    )
 
-    # 4. Save comparison results
-    save_comparison_results(comparison, path="outputs/metrics/model_comparison.json")
+    return {"summary": result, "pipeline": best_pipeline}
 
-    # 5. Select and serialize best model
-    best = select_best_model(comparison, metric="recall", models_dict=models)
-    print(f"\nBest model selected and saved: {best}")
+
+def select_best_experiment(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Pick the winning configuration using VALIDATION metrics only, in the priority
+    order the project's clinical objective implies: malignant recall, then F1, then
+    ROC-AUC (accuracy is deliberately not a criterion -- at 19.3% prevalence,
+    predicting "benign" for everyone scores 80.7%).
+    """
+    ranked = sorted(
+        results,
+        key=lambda r: (
+            r["summary"]["Val_Recall"],
+            r["summary"]["Val_F1"],
+            r["summary"]["Val_ROC_AUC"],
+        ),
+        reverse=True,
+    )
+    best = ranked[0]
+    logger.info(
+        f"Selected: {best['summary']['Model']} [{best['summary']['Imbalance_Method']}] "
+        f"-- validation recall {best['summary']['Val_Recall']:.4f}"
+    )
+    return best
+
+
+def comparison_table(results: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Build the sorted model-comparison table for reporting."""
+    rows = [r["summary"] for r in results]
+    df = pd.DataFrame([
+        {k: v for k, v in row.items() if k != "Threshold_Sweep"} for row in rows
+    ])
+    df = df.sort_values(
+        by=["Val_Recall", "Val_F1", "Val_ROC_AUC"], ascending=False
+    ).reset_index(drop=True)
+    return df
+
+
+# -----------------------------------------------------------------------------
+# Entry point
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    logger.info("=" * 78)
+    logger.info("TRAINING PIPELINE -- leakage-safe, test set untouched")
+    logger.info("=" * 78)
+
+    # 1. Deterministic cleaning + encoding, then the three-way split.
+    data = prepare_data()
+    X_train, y_train = data["X_train"], data["y_train"]
+    X_val, y_val = data["X_val"], data["y_val"]
+    feature_names = data["feature_names"]
+    numeric_cols = data["numeric_cols"]
+
+    logger.info(f"Features ({len(feature_names)}): {feature_names}")
+    categorical_indices = get_categorical_indices(feature_names, numeric_cols, verbose=True)
+
+    # 2. Controlled imbalance experiments.
+    experiments = build_experiments(y_train)
+    results: List[Dict[str, Any]] = []
+    for experiment in experiments:
+        results.append(
+            run_experiment(
+                experiment,
+                X_train, y_train,
+                X_val, y_val,
+                feature_names=feature_names,
+                numeric_cols=numeric_cols,
+            )
+        )
+
+    # 3. Comparison table (validation only).
+    table = comparison_table(results)
+    print("\n=== MODEL COMPARISON (VALIDATION SET) ===")
+    print(table.to_string(index=False))
+
+    # 4. Select the winner and lock its threshold.
+    best = select_best_experiment(results)
+    best_summary = best["summary"]
+    best_pipeline = best["pipeline"]
+    locked_threshold = float(best_summary["Threshold"])
+
+    print("\n=== THRESHOLD SWEEP (VALIDATION) FOR SELECTED MODEL ===")
+    print(pd.DataFrame(best_summary["Threshold_Sweep"]).to_string(index=False))
+
+    # 5. Persist artifacts.
+    #
+    # The Streamlit app applies imputation and scaling itself and then calls
+    # predict_proba on the resulting frame. So we save the plain classifier plus
+    # the fitted scaler and the learned medians, which together reproduce exactly
+    # the transformation the classifier was trained under.
+    os.makedirs("models", exist_ok=True)
+
+    final_classifier = best_pipeline.named_steps["clf"]
+    save_artifact(final_classifier, "models/best_model.pkl")
+
+    # Refit a standalone preprocessor on TRAIN only, matching the pipeline's
+    # first two steps, so its fitted state can be exported for inference.
+    preprocessor = build_preprocessor(numeric_cols=numeric_cols)
+    preprocessor.fit(X_train)
+
+    save_inference_artifacts(
+        preprocessor=preprocessor,
+        feature_names=feature_names,
+        numeric_cols=numeric_cols,
+        excluded_columns=data["excluded_columns"],
+        decision_threshold=locked_threshold,
+        model_dir="models",
+    )
+
+    # Save the whole fitted pipeline too -- evaluate.py uses it so that test-set
+    # preprocessing is byte-identical to what the model was trained with.
+    save_artifact(best_pipeline, "models/best_pipeline.pkl")
+
+    # 6. Comparison + selection record.
+    os.makedirs("outputs/metrics", exist_ok=True)
+    with open("outputs/metrics/model_comparison.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "evaluated_on": "validation set (16% of full data); test set untouched",
+                "cv_metric": "average_precision (5-fold StratifiedKFold on TRAIN only)",
+                "selection_rule": "max validation recall, then F1, then ROC-AUC",
+                "split_sizes": {
+                    "train": int(len(X_train)),
+                    "validation": int(len(X_val)),
+                    "test": int(len(data["X_test"])),
+                },
+                "feature_names": feature_names,
+                "smotenc_categorical_indices": categorical_indices,
+                "selected": {
+                    "model": best_summary["Model"],
+                    "imbalance_method": best_summary["Imbalance_Method"],
+                    "best_params": best_summary["Best_Params"],
+                    "locked_threshold": locked_threshold,
+                },
+                "experiments": [r["summary"] for r in results],
+            },
+            f,
+            indent=4,
+        )
+    logger.info("Model comparison saved to outputs/metrics/model_comparison.json")
+
+    print(f"\nSelected model : {best_summary['Model']} [{best_summary['Imbalance_Method']}]")
+    print(f"Best params    : {best_summary['Best_Params']}")
+    print(f"Locked threshold (from VALIDATION): {locked_threshold}")
+    print("\nTest set has NOT been touched. Run `python -m src.evaluate` for final metrics.")

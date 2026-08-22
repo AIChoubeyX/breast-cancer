@@ -1,16 +1,32 @@
 """
-Model Evaluation and Explainability Module for Breast Cancer Prediction.
-Performs test set validation, threshold calibration for high-recall screening,
-clinical performance plotting (Confusion Matrix, ROC, PR Curve), SHAP interpretability,
-and metric artifact export.
+Final Test-Set Evaluation and Explainability for Breast Cancer Prediction.
+
+This module runs EXACTLY ONE evaluation on the held-out test set, using a
+decision threshold that was already locked in by src/train.py on the validation
+set. Nothing here fits, tunes, selects or calibrates anything.
+
+What that rules out, explicitly:
+  - No threshold search against y_test (the previous version searched 81
+    candidate thresholds on the test set and reported the winner -- that is
+    test-set leakage, and the reported recall was an optimistic upper bound
+    rather than an estimate of field performance).
+  - No preprocessing fitted here. Imputation medians and scaler statistics are
+    loaded already-fitted from the training pipeline.
+  - No model refitting or model choice.
+
+SHAP is computed post hoc purely to describe the locked model. It feeds back
+into no decision, so it cannot leak. SHAP values are never reordered or filtered
+by hand -- the ranking that comes out is the ranking that gets reported, however
+clinically surprising it looks.
 """
 
-import os
 import json
-import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
-import joblib
+import matplotlib
+matplotlib.use("Agg")  # headless: no display needed for file output
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -28,473 +44,494 @@ from sklearn.metrics import (
     roc_curve,
 )
 
-from src.preprocess import (
-    encode_features,
-    handle_missing,
-    handle_outliers,
-    scale_features,
-    split_data,
-)
-from src.utils import load_artifact, load_config, save_artifact, setup_logging
+from src.preprocess import prepare_data
+from src.utils import load_artifact, setup_logging
 
 logger = setup_logging()
 
-# Styling settings for publication-quality figures
 plt.rcParams["figure.dpi"] = 150
-plt.rcParams["font.sans-serif"] = "DejaVu Sans"
 sns.set_theme(style="whitegrid", palette="muted")
 
+# Features the project brief and the review questions specifically ask about.
+# Used only to annotate the reported ranking -- never to reorder it.
+HIGHLIGHT_FEATURES = [
+    "Age",
+    "Smoking",
+    "Family_History",
+    "Tumor_Size_cm",
+    "Genetic_Mutation",
+    "BMI",
+    "Mammogram_Result",
+    "Lymph_Node_Involvement",
+]
 
-def load_test_data(
-    data_path: str = "data/breast_cancer_cleaned.csv",
-    config_path: str = "config/config.yaml",
-) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
+
+# -----------------------------------------------------------------------------
+# Artifact loading
+# -----------------------------------------------------------------------------
+def load_locked_threshold(encoders_path: str = "models/encoders.pkl") -> float:
     """
-    Load cleaned dataset and run preprocessing pipeline through test scaling.
-    CRITICAL: The test set remains completely untouched and is NEVER SMOTEd.
+    Read the decision threshold that src/train.py selected on the VALIDATION set.
 
-    Parameters:
-        data_path: Path to cleaned dataset CSV.
-        config_path: Path to configuration YAML.
-
-    Returns:
-        X_test_scaled: Scaled test feature DataFrame.
-        y_test: Test ground truth labels series.
-        feature_names: List of column feature names.
+    Raises rather than defaulting to 0.50. A silent default would quietly
+    reintroduce the bug this module exists to fix -- the operating point must be
+    an artifact of training, not a constant chosen at evaluation time.
     """
-    logger.info("Loading and preprocessing test dataset (strictly un-SMOTEd)...")
-    config = load_config(config_path) if os.path.exists(config_path) else {}
+    if not os.path.exists(encoders_path):
+        raise FileNotFoundError(
+            f"{encoders_path} not found. Run `python -m src.train` first -- the "
+            "decision threshold must come from validation, not from this script."
+        )
+    encoders = load_artifact(encoders_path)
+    if "decision_threshold" not in encoders:
+        raise KeyError(
+            f"'decision_threshold' missing from {encoders_path}. Re-run src.train; "
+            "evaluation refuses to invent a threshold."
+        )
+    threshold = float(encoders["decision_threshold"])
+    logger.info(f"Loaded LOCKED decision threshold from training artifacts: {threshold}")
+    return threshold
 
-    if not os.path.exists(data_path):
-        if os.path.exists(os.path.join("..", data_path)):
-            data_path = os.path.join("..", data_path)
-        else:
-            raise FileNotFoundError(f"Cleaned dataset not found: {data_path}")
 
-    df = pd.read_csv(data_path)
+def transform_test_features(pipeline: Any, X_test: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply the already-fitted imputation and scaling steps to the test features.
 
-    # 1. Drop any residual leakage columns
-    leakage_cols = config.get("features", {}).get("drop", ["Patient_ID", "Biopsy_Result", "Cancer_Stage"])
-    for col in leakage_cols:
-        if col in df.columns:
-            df = df.drop(columns=[col])
+    Only `transform` is called -- never `fit`. The medians and the scaler mean/std
+    are the ones learned from the training split, so test rows contribute nothing
+    to the preprocessing. The SMOTENC step is deliberately skipped: resampling is
+    a training-time device and must never touch held-out data.
+    """
+    X_out = pipeline.named_steps["impute"].transform(X_test)
+    X_out = pipeline.named_steps["scale"].transform(X_out)
+    logger.info(f"Test features transformed with train-fitted preprocessing: {X_out.shape}")
+    return X_out
 
-    # 2. Impute missing values
-    df = handle_missing(df, config)
 
-    # 3. Handle outliers
-    df = handle_outliers(df, config)
+# -----------------------------------------------------------------------------
+# Feature-name alignment (hard gate)
+# -----------------------------------------------------------------------------
+def get_model_feature_names(model: Any) -> Tuple[Optional[List[str]], str]:
+    """
+    Recover the feature names the classifier was fitted with, and say where they
+    came from. Returns (names, source).
+    """
+    names = getattr(model, "feature_names_in_", None)
+    if names is not None:
+        return list(names), "estimator.feature_names_in_"
 
-    # 4. Categorical encoding
-    df = encode_features(df, config)
+    booster = getattr(model, "get_booster", None)
+    if callable(booster):
+        try:
+            bnames = booster().feature_names
+            if bnames:
+                return list(bnames), "xgboost booster.feature_names"
+        except Exception:  # pragma: no cover - booster may be unavailable
+            pass
 
-    # 5. Separate features & target
-    target_col = config.get("features", {}).get("target", "Cancer")
-    X = df.drop(columns=[target_col])
-    y = df[target_col].astype(int)
+    return None, "unavailable"
 
-    # 6. Train/Test split
-    test_size = config.get("model", {}).get("test_size", 0.2)
-    random_state = config.get("project", {}).get("random_state", 42)
-    stratify = config.get("model", {}).get("stratify", True)
 
-    X_train, X_test, y_train, y_test = split_data(
-        X, y, test_size=test_size, random_state=random_state, stratify=stratify
+def verify_feature_alignment(X_test_final: pd.DataFrame, model: Any) -> Dict[str, Any]:
+    """
+    Assert that the columns handed to SHAP are, in order, the columns the model was
+    trained on.
+
+    This is the check that makes the SHAP ranking trustworthy. If the order
+    silently differed, every attribution would be pinned to the wrong label and
+    the ranking would look arbitrary while remaining numerically valid -- a
+    failure that is invisible without an explicit comparison. On mismatch this
+    raises instead of warning, because a misaligned explanation is worse than no
+    explanation.
+    """
+    data_names = list(X_test_final.columns)
+    model_names, source = get_model_feature_names(model)
+    n_model_features = int(getattr(model, "n_features_in_", -1))
+
+    report: Dict[str, Any] = {
+        "data_feature_count": len(data_names),
+        "model_feature_count": n_model_features if n_model_features >= 0 else None,
+        "model_feature_name_source": source,
+        "data_feature_names": data_names,
+        "model_feature_names": model_names,
+    }
+
+    if model_names is None:
+        if n_model_features >= 0 and n_model_features != len(data_names):
+            raise ValueError(
+                f"Feature COUNT mismatch: data has {len(data_names)}, model expects "
+                f"{n_model_features}. Refusing to compute SHAP."
+            )
+        report["aligned"] = "COUNT ONLY"
+        report["exact_order_match"] = None
+        logger.warning(
+            "Model exposes no feature names; verified feature COUNT only "
+            f"({len(data_names)} == {n_model_features})."
+        )
+        return report
+
+    exact = data_names == model_names
+    report["exact_order_match"] = bool(exact)
+    report["aligned"] = "YES" if exact else "NO"
+
+    if not exact:
+        mismatches = [
+            {"index": i, "data": d, "model": m}
+            for i, (d, m) in enumerate(zip(data_names, model_names))
+            if d != m
+        ]
+        report["mismatches"] = mismatches
+        raise ValueError(
+            "SHAP FEATURE ALIGNMENT FAILED -- test columns do not match the model's "
+            f"training columns. First mismatches: {mismatches[:5]}. "
+            "Stopping: a misaligned SHAP ranking would be silently wrong."
+        )
+
+    logger.info(
+        f"SHAP alignment verified: {len(data_names)} data features == "
+        f"{n_model_features} model features, exact order match (source: {source})."
     )
-
-    # 7. Scale features using fitted training scaler
-    num_cols = config.get("features", {}).get("numerical", None)
-    scaler_path = os.path.join(config.get("paths", {}).get("model_dir", "models/"), "scaler.pkl")
-
-    if os.path.exists(scaler_path):
-        scaler = load_artifact(scaler_path)
-        cols_to_scale = [c for c in (num_cols or X.columns) if c in X_test.columns]
-        X_test_scaled = X_test.copy()
-        X_test_scaled[cols_to_scale] = scaler.transform(X_test[cols_to_scale])
-    else:
-        _, X_test_scaled, _ = scale_features(X_train, X_test, numerical_cols=num_cols, save_scaler_path=scaler_path)
-
-    feature_names = X_test_scaled.columns.tolist()
-    logger.info(f"Test data loaded: {X_test_scaled.shape[0]} samples, {X_test_scaled.shape[1]} features.")
-    return X_test_scaled, y_test, feature_names
+    return report
 
 
-def evaluate_model(
+# -----------------------------------------------------------------------------
+# Test metrics at the locked threshold
+# -----------------------------------------------------------------------------
+def evaluate_at_locked_threshold(
     model: Any,
     X_test: pd.DataFrame,
     y_test: pd.Series,
-    target_recall: float = 0.90,
-    min_precision: float = 0.70,
-) -> Tuple[Dict[str, float], float]:
+    threshold: float,
+) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray]:
     """
-    Evaluate trained model on test set across key metrics (Accuracy, Precision, Recall, F1, ROC-AUC).
-    If initial Recall for Malignant class < target_recall (0.90), tunes classification probability
-    threshold between 0.10 and 0.50 to maximize Recall while keeping Precision >= min_precision (0.70).
-
-    Parameters:
-        model: Fitted classification model.
-        X_test: Test features.
-        y_test: Test true labels.
-        target_recall: Minimum desired recall threshold (default: 0.90).
-        min_precision: Minimum acceptable precision during threshold search (default: 0.70).
-
-    Returns:
-        metrics: Dictionary of evaluated metrics.
-        optimal_threshold: Selected decision threshold (0.50 or calibrated).
+    Score the model on the test set at the given threshold. One pass, no search.
     """
-    logger.info("Evaluating model predictions on test dataset...")
+    logger.info(f"Single final test evaluation at locked threshold {threshold} ...")
+    y_proba = model.predict_proba(X_test)[:, 1]
+    y_pred = (y_proba >= threshold).astype(int)
 
-    has_proba = hasattr(model, "predict_proba")
-    if has_proba:
-        y_proba = model.predict_proba(X_test)[:, 1]
-    elif hasattr(model, "decision_function"):
-        y_score = model.decision_function(X_test)
-        y_proba = (y_score - y_score.min()) / (y_score.max() - y_score.min() + 1e-9)
-    else:
-        y_proba = None
+    tn, fp, fn, tp = confusion_matrix(y_test, y_pred, labels=[0, 1]).ravel()
+    specificity = float(tn / (tn + fp)) if (tn + fp) else float("nan")
+    npv = float(tn / (tn + fn)) if (tn + fn) else float("nan")
 
-    # Base predictions at threshold 0.50
-    y_pred = model.predict(X_test)
-    optimal_threshold = 0.50
-
-    rec = recall_score(y_test, y_pred, pos_label=1, zero_division=0)
-    prec = precision_score(y_test, y_pred, pos_label=1, zero_division=0)
-    acc = accuracy_score(y_test, y_pred)
-    f1 = f1_score(y_test, y_pred, pos_label=1, zero_division=0)
-    auc = roc_auc_score(y_test, y_proba) if y_proba is not None else np.nan
-
-    logger.info(
-        f"Default Threshold (0.50) Results -> Recall: {rec:.4f}, Precision: {prec:.4f}, F1: {f1:.4f}, ROC-AUC: {auc:.4f}"
-    )
-
-    # Threshold calibration if recall < target_recall
-    if rec < target_recall and y_proba is not None:
-        logger.info(f"Initial Recall ({rec:.4f}) < target ({target_recall}). Performing threshold calibration...")
-        candidate_thresholds = np.linspace(0.10, 0.50, 81)
-        best_t = 0.50
-        best_r = rec
-        best_p = prec
-
-        for t in candidate_thresholds:
-            y_t = (y_proba >= t).astype(int)
-            r_t = recall_score(y_test, y_t, pos_label=1, zero_division=0)
-            p_t = precision_score(y_test, y_t, pos_label=1, zero_division=0)
-
-            if p_t >= min_precision and r_t >= best_r:
-                best_r = r_t
-                best_p = p_t
-                best_t = float(t)
-
-        if best_t != 0.50:
-            optimal_threshold = best_t
-            y_pred = (y_proba >= optimal_threshold).astype(int)
-            acc = accuracy_score(y_test, y_pred)
-            prec = precision_score(y_test, y_pred, pos_label=1, zero_division=0)
-            rec = recall_score(y_test, y_pred, pos_label=1, zero_division=0)
-            f1 = f1_score(y_test, y_pred, pos_label=1, zero_division=0)
-            logger.info(
-                f"Calibrated Threshold ({optimal_threshold:.3f}) Results -> Recall: {rec:.4f}, Precision: {prec:.4f}, F1: {f1:.4f}"
-            )
-
-    # Final clinical warning if recall is still under 0.90
-    if rec < target_recall:
-        warning_msg = (
-            f"WARNING: Test set Recall ({rec:.4f}) is below the required 0.90 threshold! "
-            "Further feature engineering or ensemble tuning is recommended."
-        )
-        print(f"\n[!] {warning_msg}\n")
-        logger.warning(warning_msg)
-
-    metrics = {
-        "Accuracy": round(float(acc), 4),
-        "Precision": round(float(prec), 4),
-        "Recall": round(float(rec), 4),
-        "F1_Score": round(float(f1), 4),
-        "ROC_AUC": round(float(auc), 4),
-        "Optimal_Threshold": round(float(optimal_threshold), 3),
+    metrics: Dict[str, Any] = {
+        "Decision_Threshold": round(float(threshold), 3),
+        "Threshold_Source": "selected on VALIDATION set in src.train (not tuned on test)",
+        "Test_Set_Size": int(len(y_test)),
+        "Test_Positives": int(y_test.sum()),
+        "Accuracy": round(float(accuracy_score(y_test, y_pred)), 4),
+        "Precision": round(float(precision_score(y_test, y_pred, pos_label=1, zero_division=0)), 4),
+        "Recall": round(float(recall_score(y_test, y_pred, pos_label=1, zero_division=0)), 4),
+        "F1_Score": round(float(f1_score(y_test, y_pred, pos_label=1, zero_division=0)), 4),
+        "ROC_AUC": round(float(roc_auc_score(y_test, y_proba)), 4),
+        "Average_Precision": round(float(average_precision_score(y_test, y_proba)), 4),
+        "Specificity": round(specificity, 4),
+        "NPV": round(npv, 4),
+        "Confusion_Matrix": {
+            "TN_Benign_Correct": int(tn),
+            "FP_False_Alarm": int(fp),
+            "FN_Missed_Cancer": int(fn),
+            "TP_Malignant_Correct": int(tp),
+        },
     }
 
-    return metrics, optimal_threshold
+    logger.info(
+        f"TEST -> recall={metrics['Recall']:.4f} precision={metrics['Precision']:.4f} "
+        f"F1={metrics['F1_Score']:.4f} AUC={metrics['ROC_AUC']:.4f} | "
+        f"TN={tn} FP={fp} FN={fn} TP={tp}"
+    )
+    if metrics["Recall"] < 0.90:
+        logger.warning(
+            f"Test recall {metrics['Recall']:.4f} is below the 0.90 clinical target. "
+            "Reported as-is; the threshold is NOT re-tuned on test data."
+        )
+    return metrics, y_proba, y_pred
 
 
-def plot_confusion_matrix(
-    y_true: Union[pd.Series, np.ndarray],
-    y_pred: Union[pd.Series, np.ndarray],
-    path: str = "outputs/plots/confusion_matrix.png",
-) -> None:
-    """
-    Plot and export an annotated clinical confusion matrix.
-
-    Parameters:
-        y_true: Ground truth target labels.
-        y_pred: Predicted class labels.
-        path: Filepath for PNG export.
-    """
+# -----------------------------------------------------------------------------
+# Plots
+# -----------------------------------------------------------------------------
+def plot_confusion_matrix(y_true, y_pred, threshold: float, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    cm = confusion_matrix(y_true, y_pred)
-    tn, fp, fn, tp = cm.ravel()
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
 
-    # Annotation strings with counts and percentages
-    group_counts = [f"{v:,}" for v in cm.flatten()]
-    group_pcts = [f"{v:.1%}" for v in cm.flatten() / np.sum(cm)]
-    group_names = [
+    counts = [f"{v:,}" for v in cm.flatten()]
+    pcts = [f"{v:.1%}" for v in cm.flatten() / np.sum(cm)]
+    names = [
         "True Negative (Benign)",
         "False Positive (False Alarm)",
         "False Negative (Missed Cancer)",
         "True Positive (Malignant)",
     ]
-
-    labels = [f"{n}\n{c}\n({p})" for n, c, p in zip(group_names, group_counts, group_pcts)]
-    labels = np.asarray(labels).reshape(2, 2)
+    labels = np.asarray(
+        [f"{n}\n{c}\n({p})" for n, c, p in zip(names, counts, pcts)]
+    ).reshape(2, 2)
 
     fig, ax = plt.subplots(figsize=(8, 6))
-    sns.heatmap(
-        cm,
-        annot=labels,
-        fmt="",
-        cmap="Blues",
-        cbar=True,
-        linewidths=1.2,
-        linecolor="black",
-        ax=ax,
-        annot_kws={"fontsize": 11, "fontweight": "medium"},
+    sns.heatmap(cm, annot=labels, fmt="", cmap="Blues", cbar=True,
+                linewidths=1.2, linecolor="black", ax=ax,
+                annot_kws={"fontsize": 11})
+    ax.set_title(
+        f"Confusion Matrix -- Held-out Test Set (threshold = {threshold:g})",
+        fontsize=13, fontweight="bold", pad=15,
     )
-
-    ax.set_title("Clinical Confusion Matrix (Test Set)", fontsize=14, fontweight="bold", pad=15)
-    ax.set_xlabel("Predicted Label", fontsize=12, labelpad=10)
-    ax.set_ylabel("True Ground Truth", fontsize=12, labelpad=10)
+    ax.set_xlabel("Predicted", fontsize=12, labelpad=10)
+    ax.set_ylabel("Actual", fontsize=12, labelpad=10)
     ax.set_xticklabels(["Benign (0)", "Malignant (1)"], fontsize=11)
     ax.set_yticklabels(["Benign (0)", "Malignant (1)"], fontsize=11, rotation=0)
-
     plt.tight_layout()
     plt.savefig(path, bbox_inches="tight", dpi=300)
     plt.close()
-    logger.info(f"Confusion matrix plot saved to {path}")
+    logger.info(f"Saved {path}")
 
 
-def plot_roc_curve(
-    model: Any,
-    X_test: pd.DataFrame,
-    y_test: pd.Series,
-    path: str = "outputs/plots/roc_curve.png",
-) -> None:
-    """
-    Plot and export Receiver Operating Characteristic (ROC) curve.
-
-    Parameters:
-        model: Fitted classification model.
-        X_test: Test features.
-        y_test: Test labels.
-        path: Filepath for PNG export.
-    """
+def plot_roc_curve(y_test, y_proba, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    
-    if hasattr(model, "predict_proba"):
-        y_proba = model.predict_proba(X_test)[:, 1]
-    else:
-        y_proba = model.decision_function(X_test)
-
     fpr, tpr, _ = roc_curve(y_test, y_proba)
-    auc_score = roc_auc_score(y_test, y_proba)
+    auc = roc_auc_score(y_test, y_proba)
 
     fig, ax = plt.subplots(figsize=(8, 6))
-    ax.plot(fpr, tpr, color="#2b5c8f", lw=2.5, label=f"ROC Curve (AUC = {auc_score:.4f})")
-    ax.plot([0, 1], [0, 1], color="#d9534f", lw=1.5, linestyle="--", label="Random Classifier (AUC = 0.50)")
-
-    ax.set_xlim([0.0, 1.0])
-    ax.set_ylim([0.0, 1.02])
+    ax.plot(fpr, tpr, color="#2b5c8f", lw=2.5, label=f"ROC (AUC = {auc:.4f})")
+    ax.plot([0, 1], [0, 1], color="#d9534f", lw=1.5, ls="--", label="Random (AUC = 0.50)")
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.02)
     ax.set_xlabel("False Positive Rate (1 - Specificity)", fontsize=12, labelpad=10)
-    ax.set_ylabel("True Positive Rate (Sensitivity / Recall)", fontsize=12, labelpad=10)
-    ax.set_title("Receiver Operating Characteristic (ROC) Curve", fontsize=14, fontweight="bold", pad=15)
+    ax.set_ylabel("True Positive Rate (Recall)", fontsize=12, labelpad=10)
+    ax.set_title("ROC Curve -- Held-out Test Set", fontsize=13, fontweight="bold", pad=15)
     ax.legend(loc="lower right", fontsize=11)
-    ax.grid(True, linestyle=":", alpha=0.6)
-
+    ax.grid(True, ls=":", alpha=0.6)
     plt.tight_layout()
     plt.savefig(path, bbox_inches="tight", dpi=300)
     plt.close()
-    logger.info(f"ROC curve plot saved to {path}")
+    logger.info(f"Saved {path}")
 
 
-def plot_precision_recall_curve(
-    model: Any,
-    X_test: pd.DataFrame,
-    y_test: pd.Series,
-    path: str = "outputs/plots/precision_recall_curve.png",
-) -> None:
-    """
-    Plot and export Precision-Recall curve with Average Precision (AP) score.
-
-    Parameters:
-        model: Fitted classification model.
-        X_test: Test features.
-        y_test: Test labels.
-        path: Filepath for PNG export.
-    """
+def plot_precision_recall_curve(y_test, y_proba, threshold: float, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    if hasattr(model, "predict_proba"):
-        y_proba = model.predict_proba(X_test)[:, 1]
-    else:
-        y_proba = model.decision_function(X_test)
-
     precision, recall, _ = precision_recall_curve(y_test, y_proba)
-    ap_score = average_precision_score(y_test, y_proba)
-    baseline_prev = float(y_test.mean())
+    ap = average_precision_score(y_test, y_proba)
+    prevalence = float(np.mean(y_test))
+
+    op_r = recall_score(y_test, (y_proba >= threshold).astype(int), zero_division=0)
+    op_p = precision_score(y_test, (y_proba >= threshold).astype(int), zero_division=0)
 
     fig, ax = plt.subplots(figsize=(8, 6))
-    ax.plot(recall, precision, color="#1b7837", lw=2.5, label=f"PR Curve (AP = {ap_score:.4f})")
-    ax.axhline(
-        baseline_prev,
-        color="#762a83",
-        lw=1.5,
-        linestyle="--",
-        label=f"Baseline Prevalence ({baseline_prev:.1%})",
-    )
-
-    ax.set_xlim([0.0, 1.0])
-    ax.set_ylim([0.0, 1.02])
+    ax.plot(recall, precision, color="#1b7837", lw=2.5, label=f"PR curve (AP = {ap:.4f})")
+    ax.axhline(prevalence, color="#762a83", lw=1.5, ls="--",
+               label=f"Baseline prevalence ({prevalence:.1%})")
+    ax.plot([op_r], [op_p], "o", color="#d95f02", ms=11, mec="black",
+            label=f"Locked threshold {threshold:g}")
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.02)
     ax.set_xlabel("Recall (Sensitivity)", fontsize=12, labelpad=10)
-    ax.set_ylabel("Precision (Positive Predictive Value)", fontsize=12, labelpad=10)
-    ax.set_title("Precision-Recall Curve (PR)", fontsize=14, fontweight="bold", pad=15)
-    ax.legend(loc="lower left", fontsize=11)
-    ax.grid(True, linestyle=":", alpha=0.6)
-
+    ax.set_ylabel("Precision (PPV)", fontsize=12, labelpad=10)
+    ax.set_title("Precision-Recall Curve -- Held-out Test Set",
+                 fontsize=13, fontweight="bold", pad=15)
+    ax.legend(loc="lower left", fontsize=10)
+    ax.grid(True, ls=":", alpha=0.6)
     plt.tight_layout()
     plt.savefig(path, bbox_inches="tight", dpi=300)
     plt.close()
-    logger.info(f"Precision-Recall curve plot saved to {path}")
+    logger.info(f"Saved {path}")
 
 
-def shap_analysis(
-    model: Any,
-    X_test: pd.DataFrame,
-    feature_names: List[str],
-    path: str = "outputs/plots/shap_summary.png",
-) -> List[Tuple[str, float]]:
+# -----------------------------------------------------------------------------
+# SHAP
+# -----------------------------------------------------------------------------
+def compute_shap_values(model: Any, X: pd.DataFrame) -> np.ndarray:
     """
-    Compute SHAP (SHapley Additive exPlanations) values to interpret feature attributions,
-    generate summary beeswarm plot, and identify top 5 most important predictive features.
+    Compute SHAP values for the positive (malignant) class.
 
-    Parameters:
-        model: Trained model.
-        X_test: Test features DataFrame.
-        feature_names: List of feature names.
-        path: Filepath for SHAP summary PNG export.
-
-    Returns:
-        List of (feature_name, mean_abs_shap_value) for top 5 features.
+    Returns a 2-D array of shape (n_samples, n_features) whose column order is
+    exactly X.columns -- SHAP preserves input column order, which is why
+    verify_feature_alignment() is the only guarantee the labels need.
     """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    logger.info("Computing SHAP feature attributions...")
-
-    # Determine appropriate SHAP Explainer based on model architecture
-    model_type_name = type(model).__name__.lower()
-    if "xgb" in model_type_name or "forest" in model_type_name or "tree" in model_type_name:
+    name = type(model).__name__.lower()
+    if any(k in name for k in ("xgb", "forest", "tree", "boost")):
         explainer = shap.TreeExplainer(model)
-        shap_values_raw = explainer(X_test)
-    elif "logistic" in model_type_name or "linear" in model_type_name:
-        explainer = shap.LinearExplainer(model, X_test)
-        shap_values_raw = explainer(X_test)
+    elif any(k in name for k in ("logistic", "linear", "sgd")):
+        explainer = shap.LinearExplainer(model, X)
     else:
-        explainer = shap.Explainer(model, X_test)
-        shap_values_raw = explainer(X_test)
+        explainer = shap.Explainer(model, X)
 
-    # Extract numeric matrix from Explanation object if needed
-    if hasattr(shap_values_raw, "values"):
-        vals = shap_values_raw.values
-    else:
-        vals = np.asarray(shap_values_raw)
+    raw = explainer(X)
+    vals = raw.values if hasattr(raw, "values") else np.asarray(raw)
+    vals = np.asarray(vals)
 
-    # If 3D (e.g. multiclass / binary 2-output), take slice for positive class (1)
-    if vals.ndim == 3 and vals.shape[2] == 2:
-        vals = vals[:, :, 1]
-    elif vals.ndim == 3 and vals.shape[0] == 2:
-        vals = vals[1, :, :]
+    # Binary tree models can return one matrix per class; keep the positive class.
+    if vals.ndim == 3:
+        if vals.shape[2] == 2:
+            vals = vals[:, :, 1]
+        elif vals.shape[0] == 2:
+            vals = vals[1, :, :]
+        else:
+            vals = vals[..., -1]
 
-    # Plot SHAP summary beeswarm plot
+    if vals.shape != X.shape:
+        raise ValueError(
+            f"SHAP value matrix {vals.shape} does not match feature matrix {X.shape}."
+        )
+    return vals
+
+
+def shap_ranking(
+    vals: np.ndarray,
+    feature_names: List[str],
+    csv_path: str = "outputs/metrics/shap_feature_importance.csv",
+) -> pd.DataFrame:
+    """
+    Build the COMPLETE mean|SHAP| ranking -- every feature, no truncation.
+
+    Note on interpretation: mean|SHAP| measures average contribution across the
+    cohort, so it blends effect size with prevalence. A feature that shifts risk
+    sharply but only for a small subgroup ranks below a weaker feature that
+    applies to everyone. That is a property of the metric, not an error, and it
+    is why a low rank here is not evidence that a feature is unimportant.
+    """
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    mean_abs = np.abs(vals).mean(axis=0)
+    total = float(mean_abs.sum()) or 1.0
+
+    df = pd.DataFrame({
+        "Feature": feature_names,
+        "Mean_Abs_SHAP": mean_abs,
+    })
+    df = df.sort_values("Mean_Abs_SHAP", ascending=False).reset_index(drop=True)
+    df.insert(0, "Rank", np.arange(1, len(df) + 1))
+    df["Pct_Of_Total"] = (df["Mean_Abs_SHAP"] / total * 100).round(2)
+    df["Mean_Abs_SHAP"] = df["Mean_Abs_SHAP"].round(6)
+    df["Brief_Highlighted"] = df["Feature"].isin(HIGHLIGHT_FEATURES)
+
+    df.to_csv(csv_path, index=False)
+    logger.info(f"Complete SHAP ranking ({len(df)} features) saved to {csv_path}")
+    return df
+
+
+def plot_shap_ranking(df: pd.DataFrame, path: str) -> None:
+    """Horizontal bar chart of the complete ranking."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    d = df.sort_values("Mean_Abs_SHAP", ascending=True)
+    colors = ["#2b5c8f" if h else "#b0b7bf" for h in d["Brief_Highlighted"]]
+
+    fig, ax = plt.subplots(figsize=(9, max(5, 0.36 * len(d))))
+    ax.barh(d["Feature"], d["Mean_Abs_SHAP"], color=colors, edgecolor="black", lw=0.5)
+    for y, v in zip(range(len(d)), d["Mean_Abs_SHAP"]):
+        ax.text(v, y, f" {v:.4f}", va="center", fontsize=8)
+    ax.set_xlabel("Mean |SHAP value|  (average impact on model output)",
+                  fontsize=11, labelpad=10)
+    ax.set_title("Complete SHAP Feature Importance Ranking\n"
+                 "(blue = named in the project brief; order is unmodified)",
+                 fontsize=12, fontweight="bold", pad=14)
+    ax.grid(True, axis="x", ls=":", alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(path, bbox_inches="tight", dpi=300)
+    plt.close()
+    logger.info(f"Saved {path}")
+
+
+def plot_shap_beeswarm(vals: np.ndarray, X: pd.DataFrame, path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     plt.figure(figsize=(10, 7))
     shap.summary_plot(
-        vals,
-        X_test,
-        feature_names=feature_names,
-        show=False,
-        max_display=15,
-        plot_size=(10, 7),
+        vals, X, feature_names=list(X.columns),
+        show=False, max_display=len(X.columns), plot_size=(10, 7),
     )
-    plt.title("SHAP Feature Importance & Impact Summary", fontsize=14, fontweight="bold", pad=15)
+    plt.title("SHAP Summary (impact and direction)", fontsize=13, fontweight="bold", pad=15)
     plt.tight_layout()
     plt.savefig(path, bbox_inches="tight", dpi=300)
     plt.close()
-    logger.info(f"SHAP summary plot saved to {path}")
-
-    # Compute global feature importance (Mean Absolute SHAP Value)
-    mean_abs_shap = np.abs(vals).mean(axis=0)
-    sorted_idx = np.argsort(mean_abs_shap)[::-1]
-
-    top_5_features = [(feature_names[i], round(float(mean_abs_shap[i]), 4)) for i in sorted_idx[:5]]
-    logger.info(f"Top 5 most important predictive features: {top_5_features}")
-    return top_5_features
+    logger.info(f"Saved {path}")
 
 
-def save_final_metrics(
-    metrics: Dict[str, Any],
-    path: str = "outputs/metrics/final_metrics.json",
-) -> None:
-    """
-    Export final evaluation metrics to JSON format.
-
-    Parameters:
-        metrics: Dictionary of metric key-values.
-        path: Filepath for destination JSON.
-    """
+def save_final_metrics(metrics: Dict[str, Any], path: str = "outputs/metrics/final_metrics.json") -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=4)
-    logger.info(f"Final metrics successfully exported to {path}")
+    logger.info(f"Final metrics written to {path}")
 
 
+# -----------------------------------------------------------------------------
+# Entry point
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    logger.info("Executing final model evaluation and explainability pipeline...")
+    logger.info("=" * 78)
+    logger.info("FINAL TEST EVALUATION -- one pass, locked threshold, no tuning")
+    logger.info("=" * 78)
 
-    # 1. Load un-SMOTEd test data
-    X_test, y_test, feature_names = load_test_data()
+    # 1. Rebuild the identical split (same random_state -> same rows as training).
+    data = prepare_data()
+    X_test_raw, y_test = data["X_test"], data["y_test"]
 
-    # 2. Load best trained model artifact
-    model_path = "models/best_model.pkl"
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Trained model artifact not found at {model_path}. Please run src.train first.")
-    
-    model = joblib.load(model_path)
-    logger.info(f"Loaded best model from {model_path} ({type(model).__name__})")
+    # 2. Load training artifacts.
+    pipeline_path = "models/best_pipeline.pkl"
+    if not os.path.exists(pipeline_path):
+        raise FileNotFoundError(
+            f"{pipeline_path} not found. Run `python -m src.train` first."
+        )
+    pipeline = load_artifact(pipeline_path)
+    model = pipeline.named_steps["clf"]
+    logger.info(f"Loaded model: {type(model).__name__}")
 
-    # 3. Comprehensive test evaluation with threshold tuning if needed
-    metrics, threshold = evaluate_model(model, X_test, y_test)
-    print("\n==========================================")
-    print("      FINAL TEST EVALUATION METRICS       ")
-    print("==========================================")
-    for k, v in metrics.items():
-        print(f"  {k:<20}: {v}")
-    print("==========================================")
+    threshold = load_locked_threshold()
 
-    # 4. Generate final class predictions using optimal threshold
-    if hasattr(model, "predict_proba"):
-        y_proba = model.predict_proba(X_test)[:, 1]
-        y_pred = (y_proba >= threshold).astype(int) if threshold != 0.5 else model.predict(X_test)
-    else:
-        y_pred = model.predict(X_test)
+    # 3. Transform test features with train-fitted preprocessing only.
+    X_test_final = transform_test_features(pipeline, X_test_raw)
 
-    # 5. Generate evaluation plots
-    plot_confusion_matrix(y_test, y_pred, path="outputs/plots/confusion_matrix.png")
-    plot_roc_curve(model, X_test, y_test, path="outputs/plots/roc_curve.png")
-    plot_precision_recall_curve(model, X_test, y_test, path="outputs/plots/precision_recall_curve.png")
+    # 4. Hard alignment gate -- raises on mismatch.
+    alignment = verify_feature_alignment(X_test_final, model)
 
-    # 6. Interpretability with SHAP
-    top5 = shap_analysis(model, X_test, feature_names, path="outputs/plots/shap_summary.png")
-    print("\n--- Top 5 Predictive Features (Mean |SHAP|) ---")
-    for feat, imp in top5:
-        print(f"  - {feat:<35}: {imp:.4f}")
+    # 5. Single test evaluation.
+    metrics, y_proba, y_pred = evaluate_at_locked_threshold(
+        model, X_test_final, y_test, threshold
+    )
+    metrics["Model"] = type(model).__name__
+    metrics["Feature_Alignment"] = {
+        "data_feature_count": alignment["data_feature_count"],
+        "model_feature_count": alignment["model_feature_count"],
+        "aligned": alignment["aligned"],
+        "exact_order_match": alignment["exact_order_match"],
+        "source": alignment["model_feature_name_source"],
+    }
 
-    # 7. Persist final metrics artifact
-    save_final_metrics(metrics, path="outputs/metrics/final_metrics.json")
+    print("\n" + "=" * 58)
+    print("           FINAL TEST SET METRICS")
+    print("=" * 58)
+    for k in ["Model", "Decision_Threshold", "Test_Set_Size", "Test_Positives",
+              "Accuracy", "Precision", "Recall", "F1_Score", "ROC_AUC",
+              "Average_Precision", "Specificity", "NPV"]:
+        print(f"  {k:<20}: {metrics[k]}")
+    print("  " + "-" * 54)
+    for k, v in metrics["Confusion_Matrix"].items():
+        print(f"  {k:<24}: {v}")
+    print("=" * 58)
 
-    print("\nEvaluation complete. Check outputs/plots/ and outputs/metrics/\n")
+    # 6. Plots.
+    plot_confusion_matrix(y_test, y_pred, threshold, "outputs/plots/confusion_matrix.png")
+    plot_roc_curve(y_test, y_proba, "outputs/plots/roc_curve.png")
+    plot_precision_recall_curve(y_test, y_proba, threshold,
+                                "outputs/plots/precision_recall_curve.png")
+
+    # 7. SHAP -- complete ranking, reported exactly as computed.
+    vals = compute_shap_values(model, X_test_final)
+    ranking = shap_ranking(vals, list(X_test_final.columns))
+    plot_shap_ranking(ranking, "outputs/plots/shap_feature_importance.png")
+    plot_shap_beeswarm(vals, X_test_final, "outputs/plots/shap_summary.png")
+
+    print("\n=== COMPLETE SHAP FEATURE IMPORTANCE RANKING ===")
+    print(ranking.to_string(index=False))
+
+    print("\n--- Features named in the project brief ---")
+    for feat in HIGHLIGHT_FEATURES:
+        row = ranking[ranking["Feature"] == feat]
+        if row.empty:
+            print(f"  {feat:<26}: NOT IN MODEL (excluded from feature set)")
+        else:
+            r = row.iloc[0]
+            print(f"  {feat:<26}: rank {int(r['Rank']):>2} of {len(ranking)}  "
+                  f"mean|SHAP| = {r['Mean_Abs_SHAP']:.6f}  ({r['Pct_Of_Total']:.2f}% of total)")
+
+    metrics["SHAP_Top_5"] = [
+        {"Rank": int(r.Rank), "Feature": r.Feature, "Mean_Abs_SHAP": float(r.Mean_Abs_SHAP)}
+        for r in ranking.head(5).itertuples()
+    ]
+    save_final_metrics(metrics)
+
+    print("\nEvaluation complete. Test set was used exactly once, at the locked threshold.")

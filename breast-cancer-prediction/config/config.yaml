@@ -46,26 +46,59 @@ features:
     - "Annual_Income_USD"
 
 preprocessing:
+  # Two classes of transform, separated by whether they learn anything from data.
+  #
+  # DETERMINISTIC (applied before the split -- safe, because the rule is fixed in
+  # advance and identical for every row, so no test information can flow into it):
+  #   constant categorical fills, fixed clinical bounds, fixed encoding maps.
+  #
+  # LEARNED (fitted inside the training folds only -- these are dataset statistics
+  # and would leak if computed over rows that later land in validation or test):
+  #   median imputation, StandardScaler mean/std.
   imputation:
-    BMI: "median"
+    # Constant fills -- deterministic, applied pre-split.
     Alcohol_Consumption: "No"
     Physical_Activity: "Moderate"
+    Hormone_Therapy: "No"
+    # Median fills -- learned, fitted per training fold.
+    BMI: "median"
     Tumor_Size_cm: "median"
 
   outlier_capping:
+    # Fixed physiological bounds, not percentiles of this dataset.
     BMI: [15.0, 50.0]
 
-  scaling: "StandardScaler"
+  scaling: "StandardScaler"   # continuous columns only; discrete levels left intact
 
 model:
+  # Three-way split: 20% test, then 20% of the remaining 80% as validation.
+  # Effective proportions of the full dataset: 64% train / 16% val / 20% test.
   test_size: 0.2
+  val_size: 0.2
   stratify: true
 
-  smote:
-    enabled: true
+  resampling:
+    # SMOTENC, not SMOTE: the matrix is mixed-type, and plain SMOTE would
+    # interpolate categorical columns into impossible fractional states.
+    method: "SMOTENC"
     k_neighbors: 5
+    # Applied inside the CV pipeline so held-out folds are never resampled.
+    inside_cv_pipeline: true
 
-  class_weight: "balanced"
+  # Imbalance strategies are compared as alternatives, never stacked.
+  imbalance_experiments:
+    - name: "class_weight"   # cost-sensitive only, no resampling
+      class_weight: "balanced"
+      use_smotenc: false
+    - name: "smotenc"        # resampling only, no extra weighting
+      class_weight: null
+      use_smotenc: true
+
+  cv:
+    folds: 5
+    # Hyperparameters are tuned on a threshold-free metric. Optimising recall
+    # directly would reward predicting "malignant" for every patient.
+    scoring: "average_precision"
 
   hyperparameters:
     random_forest:
@@ -83,3 +116,13 @@ evaluation:
   target_recall: 0.90
   target_f1: 0.85
   target_roc_auc: 0.90
+
+  # Decision threshold is chosen on the VALIDATION set, then locked before the
+  # test set is touched. It is persisted into models/encoders.pkl so that
+  # evaluation and the Streamlit app both read the same value instead of
+  # defaulting to 0.50 independently.
+  threshold_selection:
+    candidates: [0.50, 0.45, 0.40, 0.35, 0.30]
+    selected_on: "validation"
+    min_precision: 0.70
+    rule: "highest recall among candidates with precision >= min_precision; ties broken on F1"

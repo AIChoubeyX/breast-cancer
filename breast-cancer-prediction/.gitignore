@@ -39,7 +39,6 @@ ENV/
 
 # Data & Models (keep structure, ignore large files if needed)
 # data/*.csv  # Uncomment if dataset is large; for hackathon, keep tracked
-models/*.pkl
 outputs/plots/*.png
 outputs/metrics/*.json
 

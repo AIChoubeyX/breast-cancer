@@ -12,6 +12,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
+from pathlib import Path
 
 # -----------------------------------------------------------------------------
 # 1. PAGE CONFIGURATION & CUSTOM STYLING
@@ -102,10 +103,12 @@ def load_artifacts() -> Tuple[Any, Dict[str, Any], Any]:
     encoders_path = os.path.join(base_dir, "models", "encoders.pkl")
     model_path = os.path.join(base_dir, "models", "best_model.pkl")
 
-    if not os.path.exists(scaler_path):
-        scaler_path = "models/scaler.pkl"
-        encoders_path = "models/encoders.pkl"
-        model_path = "models/best_model.pkl"
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    MODELS_DIR = PROJECT_ROOT / "models"
+
+    scaler_path = MODELS_DIR / "scaler.pkl"
+    encoders_path = MODELS_DIR / "encoders.pkl"
+    model_path = MODELS_DIR / "best_model.pkl"
 
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model artifact not found at {model_path}. Please execute src/train.py first.")
